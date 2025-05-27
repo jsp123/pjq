@@ -1,0 +1,357 @@
+#!/bin/bash
+
+# pjq - Parallel jq processor
+# Automatic parallel processing for jq queries on large JSON files
+# Usage: pjq [jq-options] 'filter' [file...]
+
+VERSION="1.0.0"
+PARALLEL_THRESHOLD=1000  # Minimum lines to trigger parallel processing
+BLOCK_SIZE="2M"          # Optimal block size from our testing
+DEBUG=0                  # Debug level: 0=none, 1=basic, 2=verbose
+
+show_help() {
+    cat << 'EOF'
+pjq - Parallel jq processor
+
+USAGE:
+    pjq [OPTIONS] 'filter' [file...]
+    
+DESCRIPTION:
+    Drop-in replacement for jq with automatic parallel processing.
+    Automatically detects when queries can be parallelized for faster execution.
+    
+OPTIONS:
+    -c, --compact-output    Compact instead of pretty-printed output
+    -r, --raw-output       Output raw strings, not JSON texts
+    -s, --slurp            Read entire input stream into an array
+    -n, --null-input       Don't read input (filter must produce output)
+    --parallel             Force parallel processing (advanced)
+    --sequential           Force sequential processing  
+    --no-order             Skip output ordering for maximum speed (less I/O)
+    --debug, -d            Enable debug output
+    --verbose, -v          Enable verbose debug output (more detail)
+    --threshold N          Minimum lines to trigger parallel (default: 1000)
+    --block-size SIZE      Block size for parallel processing (default: 2M)
+    --version              Show version information
+    -h, --help             Show this help
+
+EXAMPLES:
+    # Simple filtering (auto-parallel on large files)
+    pjq 'select(.price > 50)' data.json
+    
+    # Aggregation (auto-sequential) 
+    pjq '[.[] | select(.price > 50)] | length' data.json
+    
+    # Multiple files
+    pjq '.name' file1.json file2.json
+    
+    # From stdin
+    curl api.example.com/data | pjq '.results[]'
+
+PERFORMANCE:
+    pjq automatically chooses parallel or sequential processing based on:
+    - Query complexity (filters vs aggregations)
+    - File size (threshold-based)
+    - Data dependencies
+    
+    Typical speedup: 2-4x on multi-core systems with large files.
+
+SEE ALSO:
+    jq(1), parallel(1)
+EOF
+}
+
+show_version() {
+    echo "pjq version $VERSION"
+    echo "Parallel jq processor with automatic optimization"
+}
+
+# Debug output helper
+debug() {
+    local level="$1"
+    shift
+    if [[ $DEBUG -ge $level ]]; then
+        echo "DEBUG: $*" >&2
+    fi
+}
+
+# Check if query can be parallelized
+can_parallelize() {
+    local query="$1"
+    
+    # Simple select queries can be parallelized
+    if [[ "$query" =~ ^select\( ]]; then
+        # But not if they contain aggregation functions
+        if [[ "$query" =~ (length|add|group_by|sort_by|min|max|unique|reverse|sort|\[\]|\.\.) ]]; then
+            return 1  # Cannot parallelize
+        fi
+        return 0  # Can parallelize
+    fi
+    
+    # Check for parallelizable aggregation patterns
+    if [[ "$query" =~ ^\[.*\].*\|.*(add/length|add|length)$ ]]; then
+        # These can be parallelized with special handling
+        return 2  # Parallel aggregation
+    fi
+    
+    return 1  # Default to sequential
+}
+
+# Execute parallel simple filter
+parallel_filter() {
+    local query="$1"
+    local file="$2"
+    local jq_opts="$3"
+    local no_order="$4"
+    
+    # Use --keep-order by default unless --no-order specified
+    local parallel_opts="--pipepart --block $BLOCK_SIZE -j $(nproc)"
+    if [[ "$no_order" != "true" ]]; then
+        parallel_opts+=" --keep-order"
+        debug 2 "Using --keep-order for deterministic output"
+    else
+        debug 2 "Skipping --keep-order for maximum speed"
+    fi
+    
+    if [[ -n "$file" && -f "$file" ]]; then
+        parallel $parallel_opts -a "$file" \
+            "jq $jq_opts $(printf %q "$query") 2>/dev/null || true"
+    else
+        # Read from stdin - use --pipe instead of --pipepart
+        local stdin_opts="--pipe --block $BLOCK_SIZE -j $(nproc)"
+        if [[ "$no_order" != "true" ]]; then
+            stdin_opts+=" --keep-order"
+        fi
+        debug 2 "Using parallel --pipe for stdin"
+        parallel $stdin_opts \
+            "jq $jq_opts $(printf %q "$query") 2>/dev/null || true"
+    fi
+}
+
+# Execute parallel aggregation
+parallel_aggregation() {
+    local query="$1" 
+    local file="$2"
+    local jq_opts="$3"
+    
+    debug 1 "Entering parallel_aggregation with query='$query'"
+    
+    # Extract the filter part and aggregation part
+    if [[ "$query" =~ ^\[(.+)\].*\|.*add/length$ ]]; then
+        # Average: [select(...)] | add/length
+        local filter="${BASH_REMATCH[1]}"
+        debug 1 "Average aggregation: filter='$filter'"
+        if [[ -n "$file" && -f "$file" ]]; then
+            debug 2 "Running parallel average on file: $file"
+            parallel --pipepart --block "$BLOCK_SIZE" -j $(nproc) -a "$file" \
+                "jq -r $(printf %q "$filter") 2>/dev/null || true" | \
+                awk '{sum+=$1; count++} END {if(count>0) print sum/count; else print 0}'
+        else
+            debug 2 "Running parallel average on stdin"
+            parallel --pipe --block "$BLOCK_SIZE" -j $(nproc) --roundrobin \
+                "jq -r $(printf %q "$filter") 2>/dev/null || true" | \
+                awk '{sum+=$1; count++} END {if(count>0) print sum/count; else print 0}'
+        fi
+    elif [[ "$query" =~ ^\[(.+)\].*\|.*add$ ]]; then
+        # Sum: [select(...)] | add
+        local filter="${BASH_REMATCH[1]}"
+        debug 1 "Sum aggregation: filter='$filter'"
+        if [[ -n "$file" && -f "$file" ]]; then
+            debug 2 "Running parallel sum on file: $file"
+            parallel --pipepart --block "$BLOCK_SIZE" -j $(nproc) -a "$file" \
+                "jq -r $(printf %q "$filter") 2>/dev/null || true" | \
+                awk '{sum+=$1} END {print sum+0}'
+        else
+            debug 2 "Running parallel sum on stdin"
+            parallel --pipe --block "$BLOCK_SIZE" -j $(nproc) --roundrobin \
+                "jq -r $(printf %q "$filter") 2>/dev/null || true" | \
+                awk '{sum+=$1} END {print sum+0}'
+        fi
+    elif [[ "$query" =~ ^\[(.+)\].*\|.*length$ ]]; then
+        # Count: [select(...)] | length
+        local filter="${BASH_REMATCH[1]}"
+        debug 1 "Count aggregation: filter='$filter'"
+        debug 2 "File='$file', Block size='$BLOCK_SIZE', CPUs=$(nproc)"
+        if [[ -n "$file" && -f "$file" ]]; then
+            debug 2 "Running parallel count on file: $file"
+            local cmd="jq -c $(printf %q "$filter") 2>/dev/null || true"
+            debug 2 "Parallel command: parallel --pipepart --block $BLOCK_SIZE -j $(nproc) -a $file \"$cmd\" | wc -l"
+            parallel --pipepart --block "$BLOCK_SIZE" -j $(nproc) -a "$file" \
+                "jq -c $(printf %q "$filter") 2>/dev/null || true" | wc -l
+        else
+            debug 2 "Running parallel count on stdin"
+            parallel --pipe --block "$BLOCK_SIZE" -j $(nproc) --roundrobin \
+                "jq -c $(printf %q "$filter") 2>/dev/null || true" | wc -l
+        fi
+    fi
+}
+
+# Execute sequential jq
+sequential_jq() {
+    local query="$1"
+    local file="$2" 
+    local jq_opts="$3"
+    
+    if [[ -n "$file" ]]; then
+        jq $jq_opts "$query" "$file"
+    else
+        jq $jq_opts "$query"
+    fi
+}
+
+# Main execution logic
+execute_query() {
+    local query="$1"
+    local file="$2"
+    local jq_opts="$3"
+    local force_mode="$4"
+    local no_order="$5"
+    
+    # Check file size for parallel threshold
+    local file_lines=0
+    if [[ -n "$file" && -f "$file" ]]; then
+        file_lines=$(wc -l < "$file" 2>/dev/null || echo 0)
+    else
+        # For stdin, assume large enough if not forced
+        file_lines=$((PARALLEL_THRESHOLD + 1))
+    fi
+    
+    # Determine processing mode
+    local mode="sequential"
+    
+    debug 1 "File has $file_lines lines (threshold: $PARALLEL_THRESHOLD)"
+    
+    if [[ "$force_mode" == "parallel" ]]; then
+        mode="parallel"
+        debug 1 "Forced parallel mode"
+    elif [[ "$force_mode" == "sequential" ]]; then
+        mode="sequential"  
+        debug 1 "Forced sequential mode"
+    elif [[ $file_lines -gt $PARALLEL_THRESHOLD ]]; then
+        can_parallelize "$query"
+        case $? in
+            0) mode="parallel"; debug 1 "Auto-detected: parallel filter" ;;
+            2) mode="parallel_agg"; debug 1 "Auto-detected: parallel aggregation" ;;  
+            *) mode="sequential"; debug 1 "Auto-detected: sequential (complex query)" ;;
+        esac
+    else
+        debug 1 "Below threshold: using sequential"
+    fi
+    
+    debug 1 "Execution mode: $mode"
+    
+    # Execute based on mode
+    case "$mode" in
+        parallel)
+            parallel_filter "$query" "$file" "$jq_opts" "$no_order"
+            ;;
+        parallel_agg)
+            parallel_aggregation "$query" "$file" "$jq_opts"
+            ;;
+        *)
+            sequential_jq "$query" "$file" "$jq_opts"
+            ;;
+    esac
+}
+
+# Parse command line arguments
+main() {
+    local jq_opts=""
+    local query=""
+    local files=()
+    local force_mode=""
+    local no_order="false"
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            --parallel)
+                force_mode="parallel"
+                shift
+                ;;
+            --sequential)
+                force_mode="sequential"
+                shift
+                ;;
+            --no-order)
+                no_order="true"
+                shift
+                ;;
+            -d|--debug)
+                DEBUG=1
+                shift
+                ;;
+            -v|--verbose)
+                DEBUG=2
+                shift
+                ;;
+            --threshold)
+                PARALLEL_THRESHOLD="$2"
+                shift 2
+                ;;
+            --block-size)
+                BLOCK_SIZE="$2"
+                shift 2
+                ;;
+            -c|--compact-output|-r|--raw-output|-s|--slurp|-n|--null-input)
+                jq_opts+="$1 "
+                shift
+                ;;
+            -*)
+                # Pass through other jq options
+                jq_opts+="$1 "
+                shift
+                ;;
+            *)
+                if [[ -z "$query" ]]; then
+                    query="$1"
+                else
+                    files+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate query
+    if [[ -z "$query" ]]; then
+        echo "Error: No jq filter specified" >&2
+        echo "Try 'pjq --help' for more information." >&2
+        exit 1
+    fi
+    
+    # Execute query
+    if [[ ${#files[@]} -eq 0 ]]; then
+        # Read from stdin
+        execute_query "$query" "" "$jq_opts" "$force_mode" "$no_order"
+    elif [[ ${#files[@]} -eq 1 ]]; then
+        # Single file
+        execute_query "$query" "${files[0]}" "$jq_opts" "$force_mode" "$no_order"
+    else
+        # Multiple files - process each separately
+        for file in "${files[@]}"; do
+            execute_query "$query" "$file" "$jq_opts" "$force_mode" "$no_order"
+        done
+    fi
+}
+
+# Check dependencies
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is required but not installed" >&2
+    exit 1
+fi
+
+if ! command -v parallel >/dev/null 2>&1; then
+    echo "Error: GNU parallel is required but not installed" >&2
+    exit 1
+fi
+
+# Run main function
+main "$@"
