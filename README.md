@@ -28,7 +28,7 @@ brew install jq parallel      # macOS
 ### Quick Install (Local)
 ```bash
 # Download and make executable
-curl -O https://raw.githubusercontent.com/yourusername/pjq/main/pjq
+curl -O https://raw.githubusercontent.com/jsp123/pjq/main/pjq
 chmod +x pjq
 
 # Use with ./pjq
@@ -38,7 +38,7 @@ chmod +x pjq
 ### System-wide Install
 ```bash
 # Download pjq
-curl -O https://raw.githubusercontent.com/yourusername/pjq/main/pjq
+curl -O https://raw.githubusercontent.com/jsp123/pjq/main/pjq
 chmod +x pjq
 
 # Install to system PATH
